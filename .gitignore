@@ -1,0 +1,7 @@
+# Configuracao e artefactos locais
+**/config_local.h
+.env
+*.bin
+*.elf
+*.map
+build/

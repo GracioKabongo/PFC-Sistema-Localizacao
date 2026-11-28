@@ -1,0 +1,22 @@
+name: Compilar firmware ESP32
+on:
+  pull_request:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Instalar núcleo e bibliotecas
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install "TinyGSM@0.12.0" "PubSubClient@2.8" "ArduinoJson@7.4.2" "TinyGPSPlus"
+      - name: Compilar exemplo sem credenciais
+        run: arduino-cli compile --fqbn esp32:esp32:esp32 firmware/sistema_restreio

@@ -1,9 +1,12 @@
-#include <WiFi.h>
+#include <Arduino.h>
+#include <esp_system.h>
+#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_RX_BUFFER 1024
+#include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <TinyGPS++.h>
 #include <Preferences.h>
-#include <WiFiClientSecure.h>
 #include <math.h>
 #include "gk_types.h"
 
@@ -22,17 +25,13 @@ void aplicarLimites();
 bool limitesValidos(double n,double s,double o,double l);
 void aplicarComando(const char* json);
 void tarefaRede(void*);
-void tarefaGSM(void*);
 //https://restreio-60ka41f0a-wscode.vercel.app/
 // ============================================================
 // PROTOTIPOS
 // ============================================================
 
-void conectarWiFi();
 void conectarMQTT();
-
-void inicializacaoGSM();
-void atualizarSerialGSM(unsigned long tempo);
+void confirmar(const String& id,const char* comando,const char* estado,const char* erro="");
 bool enviarSMS(const String& mensagem);
 
 void inicializarGPS();
@@ -65,10 +64,14 @@ void IRAM_ATTR interrupcaoSOS();
 
 
 // ============================================================
-// WIFI
+// CONFIGURACAO LOCAL
 // ============================================================
 
+#if __has_include("config_local.h")
 #include "config_local.h"
+#else
+#include "config_local.example.h"
+#endif
 
 
 
@@ -159,18 +162,14 @@ TinyGPSPlus gps;
 
 
 // ============================================================
-// WIFI / MQTT
+// GPRS / MQTT
 // ============================================================
 
-#if GK_MQTT_TLS
-WiFiClientSecure espClient;
-#else
-WiFiClient espClient;
-#endif
-
-PubSubClient mqttClient(
-  espClient
-);
+// Apenas tarefaRede acede ao modem, ao UART2 e aos clientes de rede.
+// MQTT inicia uma ligacao TCP de saida; nenhum servidor no dispositivo.
+TinyGsm modem(sim);
+TinyGsmClient gprsClient(modem);
+PubSubClient mqttClient(gprsClient);
 
 
 // ============================================================
@@ -373,335 +372,28 @@ void IRAM_ATTR interrupcaoSOS() {
 
 
 // ============================================================
-// CONECTAR WIFI
-// ============================================================
-
-void conectarWiFi() {
- static unsigned long tentativa=0;
- if(WiFi.status()==WL_CONNECTED) return;
- if(tentativa && millis()-tentativa<15000) return;
- tentativa=millis(); WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_SENHA);
-}
-
-
-// ============================================================
-// CONECTAR MQTT
+// CONECTAR MQTT SOBRE GPRS (executado apenas pela tarefaRede)
 // ============================================================
 
 void conectarMQTT() {
- static unsigned long tentativa=0;
- if(mqttClient.connected() || WiFi.status()!=WL_CONNECTED) return;
- if(tentativa && millis()-tentativa<5000) return;
- tentativa=millis();
- String clientId=String("GK_")+OBJETO_ID+"_"+String((uint32_t)ESP.getEfuseMac(),HEX);
- if(mqttClient.connect(clientId.c_str(),GK_MQTT_USER,GK_MQTT_PASSWORD)) mqttClient.subscribe(MQTT_TOPIC_COMANDO,1);
-}
-
-
-// ============================================================
-// GSM - ATUALIZAR SERIAL
-// ============================================================
-
-void atualizarSerialGSM(
-  unsigned long tempo
-) {
-
-  unsigned long inicio =
-    millis();
-
-  while (
-    millis() -
-    inicio <
-    tempo
-  ) {
-
-    while (
-      sim.available()
-    ) {
-
-      Serial.write(
-        sim.read()
-      );
-
+  static unsigned long tentativa = 0;
+  static bool tentado = false;
+  if (mqttClient.connected()) return;
+  if (tentado && millis() - tentativa < 10000UL) return;
+  tentado = true;
+  tentativa = millis();
+  String clientId = String("GK_") + OBJETO_ID + "_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (mqttClient.connect(clientId.c_str(), GK_MQTT_USER, GK_MQTT_PASSWORD)) {
+    if (!mqttClient.subscribe(MQTT_TOPIC_COMANDO, 1)) {
+      mqttClient.disconnect();
+      Serial.println("MQTT: falha na subscricao.");
+    } else {
+      Serial.println("MQTT: ligado via GPRS.");
     }
-
-    while (
-      Serial.available()
-    ) {
-
-      sim.write(
-        Serial.read()
-      );
-
-    }
-
-    delay(5);
-
+  } else {
+    Serial.printf("MQTT: falha de ligacao (%d).\n", mqttClient.state());
   }
-
 }
-
-
-// ============================================================
-// INICIALIZAR GSM
-// ============================================================
-
-void inicializacaoGSM() {
-
-  Serial.println();
-
-  Serial.println(
-    "===================================="
-  );
-
-  Serial.println(
-    "INICIALIZANDO GSM"
-  );
-
-  Serial.println(
-    "===================================="
-  );
-
-  delay(300);
-
-
-  sim.println(
-    "AT"
-  );
-
-  atualizarSerialGSM(
-    300
-  );
-
-
-  sim.println(
-    "AT+CMGF=1"
-  );
-
-  atualizarSerialGSM(
-    300
-  );
-
-
-  sim.println(
-    "AT+CNMI=1,2,0,0,0"
-  );
-
-  atualizarSerialGSM(
-    300
-  );
-
-  Serial.println(
-    "GSM pronto."
-  );
-
-}
-
-
-// ============================================================
-// ENVIAR SMS
-// ============================================================
-
-bool enviarSMSModem(
-  const String& mensagem
-) {
-
-  Serial.println();
-
-  Serial.println(
-    "===================================="
-  );
-
-  Serial.println(
-    "ENVIO DE SMS"
-  );
-
-  Serial.println(
-    "===================================="
-  );
-
-
-  sim.println(
-    "AT"
-  );
-
-  atualizarSerialGSM(
-    200
-  );
-
-
-  sim.println(
-    "AT+CMGF=1"
-  );
-
-  atualizarSerialGSM(
-    200
-  );
-
-
-  sim.print(
-    "AT+CMGS=\""
-  );
-
-  sim.print(
-    NUMERO_SMS
-  );
-
-  sim.println(
-    "\""
-  );
-
-
-  unsigned long inicio =
-    millis();
-
-  bool pronto =
-    false;
-
-  while (
-    millis() -
-    inicio <
-    2500
-  ) {
-
-    while (
-      sim.available()
-    ) {
-
-      char c =
-        sim.read();
-
-      Serial.write(
-        c
-      );
-
-      if (
-        c ==
-        '>'
-      ) {
-
-        pronto =
-          true;
-
-        break;
-
-      }
-
-    }
-
-    if (
-      pronto
-    ) {
-
-      break;
-
-    }
-
-    delay(10);
-
-  }
-
-
-  if (
-    !pronto
-  ) {
-
-    Serial.println();
-
-    Serial.println(
-      "GSM nao respondeu ao AT+CMGS."
-    );
-
-    return false;
-
-  }
-
-
-  sim.print(
-    mensagem
-  );
-
-
-  sim.write(
-    26
-  );
-
-
-  inicio =
-    millis();
-
-  String resposta;
-
-
-  while (
-    millis() -
-    inicio <
-    5000
-  ) {
-
-    while (
-      sim.available()
-    ) {
-
-      char c =
-        sim.read();
-
-      Serial.write(
-        c
-      );
-
-      resposta +=
-        c;
-
-    }
-
-
-    if (
-      resposta.indexOf("+CMGS:") >= 0 && resposta.indexOf("OK") >= 0
-    ) {
-
-      Serial.println();
-
-      Serial.println(
-        "Modem aceitou SMS; entrega ao destinatario nao confirmada."
-      );
-
-      return true;
-
-    }
-
-
-    if (
-      resposta.indexOf(
-        "ERROR"
-      ) >= 0
-    ) {
-
-      Serial.println();
-
-      Serial.println(
-        "Erro no envio do SMS."
-      );
-
-      return false;
-
-    }
-
-    delay(10);
-
-  }
-
-
-  Serial.println();
-
-  Serial.println(
-    "Timeout aguardando SMS."
-  );
-
-  return false;
-
-}
-
 
 // ============================================================
 // INICIALIZAR GPS
@@ -1309,8 +1001,9 @@ void setup() {
  }
  aplicarLimites();inicializarGPS();
  sim.begin(9600,SERIAL_8N1,GSM_RX,GSM_TX);
- xTaskCreate(tarefaGSM,"gk-gsm",4096,nullptr,1,nullptr);
- xTaskCreate(tarefaRede,"gk-rede",8192,nullptr,1,nullptr);
+ if (xTaskCreate(tarefaRede,"gk-modem",12288,nullptr,1,nullptr) != pdPASS) {
+   Serial.println("ERRO: tarefa de comunicacao indisponivel; monitoria local activa.");
+ }
  Serial.println("GK: seguranca local activa; GNSS real, sem fallback simulado.");
 }
 
@@ -1331,7 +1024,7 @@ bool limitesValidos(double n,double s,double o,double l){return isfinite(n)&&isf
 void aplicarLimites(){LIMITE_NORTE=zonaPersistida.norte;LIMITE_SUL=zonaPersistida.sul;LIMITE_OESTE=zonaPersistida.oeste;LIMITE_LESTE=zonaPersistida.leste;}
 void enfileirarJson(JsonDocument& doc,bool ack){MensagemSaida m={};m.criada=millis();m.ack=ack;serializeJson(doc,m.json,sizeof(m.json));if(xQueueSend(filaSaida,&m,0)!=pdTRUE)Serial.println("Fila MQTT cheia: registo descartado; confirmar no teste offline.");}
 void registarEvento(const char* tipo){eventoActual=tipo;eventoId=bootId+"-"+String(++eventoSeq);publicarTelemetria();}
-void confirmar(const String& id,const char* comando,const char* estado,const char* erro=""){
+void confirmar(const String& id,const char* comando,const char* estado,const char* erro){
  JsonDocument a;a["id"]=OBJETO_ID;a["commandId"]=id;a["comando"]=comando;a["estado"]=estado;a["erro"]=erro;a["versaoConfiguracao"]=zonaPersistida.versao;
  if(String(comando)=="configurar_geofencing"){auto z=a["zona"].to<JsonObject>();z["tipo"]="rectangle";z["norte"]=LIMITE_NORTE;z["sul"]=LIMITE_SUL;z["oeste"]=LIMITE_OESTE;z["leste"]=LIMITE_LESTE;}
  enfileirarJson(a,true);
@@ -1360,25 +1053,112 @@ void aplicarComando(const char* json){
  else if(id.length())confirmar(id,"sos","rejeitado","Fila SMS cheia");
  }
 }
-// GK-03: tarefa MQTT pode aguardar rede sem suspender GNSS, botao ou LED.
-void tarefaRede(void*){
- #if GK_MQTT_TLS
- espClient.setCACert(GK_MQTT_CA);
- configTime(0,0,"pool.ntp.org");
- #endif
- mqttClient.setServer(MQTT_BROKER,MQTT_PORT);mqttClient.setCallback(receberComando);mqttClient.setBufferSize(2048);mqttClient.setSocketTimeout(2);
- MensagemSaida m={};bool pendente=false;
- for(;;){conectarWiFi();conectarMQTT();if(mqttClient.connected()){
- mqttClient.loop();if(!pendente)pendente=xQueueReceive(filaSaida,&m,0)==pdTRUE;
- if(pendente&&!m.ack&&millis()-m.criada>5000){
- JsonDocument antiga;if(!deserializeJson(antiga,m.json)){
- antiga["gpsFix"]=false;antiga["origem"]="INDISPONIVEL";antiga["latitude"]=nullptr;antiga["longitude"]=nullptr;
- antiga["dentroDaArea"]=nullptr;antiga["foraDaArea"]=nullptr;antiga["historicoOffline"]=true;
- serializeJson(antiga,m.json,sizeof(m.json));}
- }
- if(pendente&&mqttClient.publish(m.ack?"rastreamento/confirmacao":MQTT_TOPIC_TELEMETRIA,m.json))pendente=false;
- }vTaskDelay(pdMS_TO_TICKS(10));}
+// GK-03/GK-04: uma unica tarefa possui o SIM800L e UART2.
+// As esperas de rede nao bloqueiam o loop de GNSS, geofencing ou SOS fisico.
+// SMS tem prioridade entre operacoes, mas nao interrompe comandos AT em curso.
+void tarefaRede(void*) {
+  bool mqttPermitido = GK_MQTT_LAB_PRIVADO && GK_APN[0] &&
+      MQTT_BROKER[0] && GK_MQTT_USER[0] && GK_MQTT_PASSWORD[0] &&
+      MQTT_PORT > 0 && MQTT_PORT <= 65535;
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(receberComando);
+  if (!mqttClient.setBufferSize(2048)) mqttPermitido = false;
+  mqttClient.setSocketTimeout(10);
+  mqttClient.setKeepAlive(60);
+  if (!mqttPermitido) Serial.println("MQTT desactivado: configurar rede privada de ensaio, APN e credenciais.");
+  MensagemSaida m = {};
+  bool pendente = false;
+  bool inicializado = false, rede = false, dados = false;
+  bool consultado = false, tentouDados = false;
+  unsigned long ultimaConsulta = 0, ultimaTentativaDados = 0;
+
+  for (;;) {
+    if (!inicializado) {
+      inicializado = modem.init(GK_SIM_PIN[0] ? GK_SIM_PIN : nullptr);
+      if (!inicializado) {
+        Serial.println("SIM800L: inicializacao falhou.");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+      consultado = false;
+      Serial.println("SIM800L: inicializado.");
+    }
+
+    if (!consultado || millis() - ultimaConsulta >= 5000UL) {
+      consultado = true;
+      ultimaConsulta = millis();
+      rede = modem.isNetworkConnected();
+      if (dados && (!rede || !modem.isGprsConnected())) {
+        dados = false;
+        gprsClient.stop();
+        Serial.println("GPRS: ligacao perdida.");
+      }
+      if (!rede && !modem.testAT(1000L)) {
+        inicializado = false;
+        dados = false;
+        continue;
+      }
+    }
+
+    // Nao retirar da fila enquanto a rede GSM nao estiver registada.
+    MensagemSMS sms = {};
+    if (rede && xQueueReceive(filaSMS, &sms, 0) == pdTRUE) {
+      bool ok = NUMERO_SMS[0] && modem.sendSMS(String(NUMERO_SMS), String(sms.texto));
+      Serial.println(ok ? "SMS: ACEITE PELO MODEM; ENTREGA NAO CONFIRMADA"
+                        : "SMS: FALHA/SEM CONFIRMACAO");
+      // Nao repetir automaticamente um envio ambiguo (risco de duplicacao).
+      consultado = false;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    if (!rede || !mqttPermitido) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (!dados && (!tentouDados || millis() - ultimaTentativaDados >= 15000UL)) {
+      tentouDados = true;
+      Serial.println("GPRS: tentativa de ligacao.");
+      dados = modem.gprsConnect(GK_APN, GK_APN_USER, GK_APN_PASSWORD);
+      ultimaTentativaDados = millis();
+      consultado = false;
+      Serial.println(dados ? "GPRS: ligado." : "GPRS: falha.");
+      // Voltar ao inicio para dar prioridade a SMS entretanto enfileirados.
+      continue;
+    }
+
+    if (dados) {
+      conectarMQTT();
+      if (mqttClient.connected()) {
+        mqttClient.loop();
+        if (!pendente) pendente = xQueueReceive(filaSaida, &m, 0) == pdTRUE;
+        if (pendente && !m.ack && millis() - m.criada > 5000) {
+          JsonDocument antiga;
+          if (!deserializeJson(antiga, m.json)) {
+            antiga["gpsFix"] = false;
+            antiga["origem"] = "INDISPONIVEL";
+            antiga["latitude"] = nullptr;
+            antiga["longitude"] = nullptr;
+            antiga["dentroDaArea"] = nullptr;
+            antiga["foraDaArea"] = nullptr;
+            antiga["historicoOffline"] = true;
+            serializeJson(antiga, m.json, sizeof(m.json));
+          }
+        }
+        // PubSubClient publica em QoS 0: sucesso local nao comprova entrega.
+        if (pendente && mqttClient.publish(m.ack ? "rastreamento/confirmacao" :
+                                          MQTT_TOPIC_TELEMETRIA, m.json)) pendente = false;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
-// GK-04: SIM800L continua a enviar SMS; aceitar na fila nao prova entrega.
-bool enviarSMS(const String& mensagem){MensagemSMS m={};mensagem.toCharArray(m.texto,sizeof(m.texto));return xQueueSend(filaSMS,&m,0)==pdTRUE;}
-void tarefaGSM(void*){inicializacaoGSM();MensagemSMS m;for(;;){if(xQueueReceive(filaSMS,&m,portMAX_DELAY)==pdTRUE){bool ok=enviarSMSModem(String(m.texto));Serial.println(ok?"SMS: ACEITE PELO MODEM":"SMS: FALHA/SEM CONFIRMACAO");}}}
+
+bool enviarSMS(const String& mensagem) {
+  MensagemSMS m = {};
+  mensagem.toCharArray(m.texto, sizeof(m.texto));
+  if (xQueueSend(filaSMS, &m, 0) == pdTRUE) return true;
+  Serial.println("Fila SMS cheia: alerta nao enfileirado.");
+  return false;
+}
